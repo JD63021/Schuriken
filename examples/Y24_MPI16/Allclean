@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$CASE"
+rm -rf processor* postProcessing
+find . -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex './([1-9][0-9]*|[0-9]+\.[0-9]+)' -exec rm -rf {} +
+rm -f log.* *.resource *.elapsed_seconds
+echo "SCHURIKEN_Y24_EXAMPLE_CLEAN=PASS"

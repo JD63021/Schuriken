@@ -1,0 +1,126 @@
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      controlDict;
+}
+
+libs
+(
+    "libSchuriken.so"
+);
+
+
+application     foamRun;
+solver          incompressibleFluid;
+startFrom        startTime;
+startTime        0;
+
+stopAt          endTime;
+endTime          1000;
+deltaT          1;
+
+writeControl    timeStep;
+writeInterval   1;
+purgeWrite      1;
+
+writeFormat     ascii;
+writePrecision  12;
+writeCompression off;
+
+timeFormat      general;
+timePrecision   10;
+
+runTimeModifiable false;
+
+functions
+{
+    inletAverage
+    {
+        type            surfaceFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        log             true;
+        writeFields     false;
+
+        regionType      patch;
+        name            inlet;
+
+        operation       areaAverage;
+        fields          (p U);
+
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+
+    outletAverage
+    {
+        type            surfaceFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        log             true;
+        writeFields     false;
+
+        regionType      patch;
+        name            outlet;
+
+        operation       areaAverage;
+        fields          (p U);
+
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+
+    inletFlux
+    {
+        type            surfaceFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        log             true;
+        writeFields     false;
+
+        regionType      patch;
+        name            inlet;
+
+        operation       sum;
+        fields          (phi);
+
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+
+    outletFlux
+    {
+        type            surfaceFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        log             true;
+        writeFields     false;
+
+        regionType      patch;
+        name            outlet;
+
+        operation       sum;
+        fields          (phi);
+
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+
+    // --------------------------------------------------------
+    // Wall y+ diagnostic
+    // --------------------------------------------------------
+    yPlusWall
+    {
+        type            yPlus;
+        libs            ("libfieldFunctionObjects.so");
+
+        enabled         true;
+        log             true;
+        writeToFile     true;
+
+        executeControl  timeStep;
+        executeInterval 1;
+
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+
+}

@@ -4,3 +4,10 @@ src/Make/linux*/
 log.*
 *.swp
 *~
+
+# OpenFOAM generated data
+**/processor*/
+**/postProcessing/
+**/log.*
+**/*.resource
+**/*.elapsed_seconds

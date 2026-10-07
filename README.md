@@ -156,6 +156,24 @@ Each rank stores its local part of every recycled vector. Global POD inner
 products and reduced matrices are formed with batched collectives on the mesh
 communicator. The full pressure or POD vectors are never gathered to one rank.
 
+
+## Reproducible Y24 example
+
+A complete 22,848-cell Y24 pipe case, including the OpenFOAM mesh, is provided under:
+
+```text
+examples/Y24_MPI16/
+```
+
+After building Schuriken, reproduce the validated 16-rank run with:
+
+```bash
+cd ~/Schuriken/examples/Y24_MPI16
+./Allrun
+```
+
+The example is a normal OpenFOAM case. `pcgninja` is selected in `fvSolution`, `libSchuriken.so` is loaded from `controlDict`, and MPI is launched normally. No Schuriken-specific tolerance or parallel arguments are required.
+
 ## Repository layout
 
 ```text
@@ -222,7 +240,7 @@ final recycled rank       24
 accepted updates          12
 DeltaP                    18834.856899
 mean y+                   24.0449682316
-wall time                 6.28 s
+wall time                 6.15 s
 ```
 
 Representative serial reference from the development campaign:
@@ -239,7 +257,7 @@ wall time                 14.64 s
 ```
 
 The MPI run reproduced the same outer iteration count and essentially the same
-physics while reducing wall time by about **2.33x** on this relatively small
+physics while reducing wall time by about **2.38x** on this relatively small
 22,848-cell case. MPI required a richer recycled space and more Krylov work,
 which is expected because decomposition changes the parallel GAMG hierarchy and
 floating-point reduction order.

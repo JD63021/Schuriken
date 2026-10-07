@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+NP="${NP:-16}"
+if [[ -z "${WM_PROJECT_DIR:-}" ]]; then
+  if [[ -f /opt/openfoam12/etc/bashrc ]]; then
+    set +u; source /opt/openfoam12/etc/bashrc; set -u
+  else
+    echo "ERROR: OpenFOAM environment not loaded" >&2; exit 2
+  fi
+fi
+CASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$CASE"
+[[ -f "$FOAM_USER_LIBBIN/libSchuriken.so" ]] || { echo "ERROR: libSchuriken.so not built" >&2; exit 3; }
+
+python3 - "$NP" <<'PY'
+from pathlib import Path
+import re,sys
+np=sys.argv[1]
+p=Path('system/decomposeParDict')
+s=p.read_text()
+s,n=re.subn(r'(?m)^([ \t]*numberOfSubdomains[ \t]+)[^;]+;',lambda m:m.group(1)+np+';',s,count=1)
+if n != 1: raise SystemExit('ERROR: numberOfSubdomains not found')
+p.write_text(s)
+PY
+
+echo "SCHURIKEN_Y24_EXAMPLE_DECOMPOSE=np=$NP"
+decomposePar -force 2>&1 | tee log.decomposePar
+
+echo "SCHURIKEN_Y24_EXAMPLE_RUN=mpirun -np $NP foamRun -parallel"
+start_ns="$(date +%s%N)"
+set +e
+/usr/bin/time -v -o log.resource mpirun -np "$NP" foamRun -parallel 2>&1 | tee log.run
+rc="${PIPESTATUS[0]}"
+set -e
+end_ns="$(date +%s%N)"
+elapsed_ns=$((end_ns-start_ns))
+printf '%d.%09d\n' $((elapsed_ns/1000000000)) $((elapsed_ns%1000000000)) > log.elapsed_seconds
+
+echo "RUN_EXIT_CODE=$rc"
+grep -E 'Elapsed \(wall clock\)|Maximum resident set size|Exit status' log.resource || true
+[[ "$rc" -eq 0 ]] || exit "$rc"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+s=Path('log.run').read_text(errors='ignore')
+conv=re.findall(r'(?:PIMPLE|SIMPLE) solution converged in\s+(\d+)\s+iterations',s)
+its=[int(x) for x in re.findall(r'pcgninja:\s+Solving for p,.*?No Iterations\s+(\d+)',s)]
+cums=re.findall(r'SCHURIKEN_AMGSENSEI_CUMULATIVE[^\n]*',s)
+last=cums[-1] if cums else ''
+def iv(k,d=None):
+    m=re.search(r'\b'+re.escape(k)+r'=(\d+)',last)
+    return int(m.group(1)) if m else d
+pins=[float(x) for x in re.findall(r'areaAverage\("[^"]*(?:inlet|inflow)[^"]*"\)\s+of p\s*=\s*([0-9.eE+-]+)',s,re.I)]
+yps=[float(x) for x in re.findall(r'patch\s+wall\s+y\+.*?average\s*=\s*([0-9.eE+-]+)',s,re.I)]
+try: elapsed=float(Path('log.elapsed_seconds').read_text().strip())
+except Exception: elapsed=None
+print('\n'+'='*88)
+print('SCHURIKEN Y24 MPI EXAMPLE SUMMARY')
+print('='*88)
+print('outer iterations :',int(conv[-1]) if conv else 'NA')
+print('pressure solves  :',iv('solves',len(its)))
+print('total PCG        :',iv('totalPCGIts',sum(its)))
+print('stock PCG        :',iv('stockPCGIts'))
+print('POD PCG          :',iv('podPCGIts'))
+print('rank             :',iv('rank'))
+print('accepted updates :',iv('acceptedUpdates'))
+print('DeltaP           :',pins[-1] if pins else 'NA')
+print('mean y+          :',yps[-1] if yps else 'NA')
+print('wall seconds     :',elapsed if elapsed is not None else 'NA')
+print('='*88)
+PY
+
+echo "SCHURIKEN_Y24_EXAMPLE=PASS"
