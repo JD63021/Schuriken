@@ -10,16 +10,16 @@ solvers
 {
     p
     {
-        // Bounded adaptive learned coarse space: grow 2 -> ... -> 24,
-        // AMG-spectral compress 24 -> 16, then regrow.  No replay probes.
-        podTrainSnapshots  3;
-        podAddRank         2;
-        podMaxRank         24;
-        podRecompressRank  16;
-        podTailIter        10;
-        // OF12 case executes two pressure solves/SIMPLE; learn from the
-        // odd (first/harder) solve only, deploy on both.
-        podLearnOddOnly    1;
+        AMGsensei
+        {
+            enabled             true;
+            trainSnapshots      3;
+            addRank             2;
+            maxRank             24;
+            recompressRank      16;
+            tailIter            10;
+            learnOddOnly        1;
+        }
 
         solver          pcgninja;
 
