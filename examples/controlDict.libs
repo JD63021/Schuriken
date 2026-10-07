@@ -1,0 +1,5 @@
+// Add this entry to system/controlDict so OpenFOAM loads Schuriken at runtime.
+libs
+(
+    "libSchuriken.so"
+);

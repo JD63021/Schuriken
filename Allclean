@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/src"
+wclean libso . || true
+rm -f "${FOAM_USER_LIBBIN:-/nonexistent}/libSchuriken.so" 2>/dev/null || true

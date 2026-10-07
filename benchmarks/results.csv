@@ -1,0 +1,11 @@
+case,method,mpi_ranks,outer_iterations,wall_seconds,total_krylov_iterations,rank,deltaP,mean_yplus,notes
+Y84,stock_PCG_GAMG,1,259,109.22,67242,0,17538.9398643,79.3688092,serial stock reference campaign
+Y84,adaptive_POD_PCG_GAMG,1,259,25.82,5227,24,NA,NA,matched adaptive campaign; about 4.23x wall speedup; exact adaptive final fields not retained in this table
+Y24,stock_PCG_GAMG_practical,1,NA,40.14,20203,0,18820.19,24.043,practical p abs=1e-5 relTol=0.1 campaign
+Y24,adaptive_POD_PCG_GAMG_practical,1,NA,23.56,5778,NA,18820.23,24.043,matched practical tolerance campaign
+Y24,adaptive_POD_PCG_GAMG_tuned,1,126,14.636996810,4115,18,18835.8283963,24.0450293652,representative serial tuned run
+Y24,pcgninja_MPI,16,126,6.277981922,5739,24,18834.856899,24.0449682316,Schuriken v0.2 MPI validation; 12 accepted updates
+Y120,adaptive_POD_PCG_GAMG_tuned,1,343,21.65,7873,24,17014.4500,120.3360,AU=.70 AP=.50 AK=.70 AO=.70 pRel=.10
+Y120,experimental_P10_FGMRES_POD,1,131,11.88,811,2,17013.4595,120.3351,experimental polynomial Schur route; problem-dependent
+Y84,experimental_P10_FGMRES_POD,1,134,21.25,878,2,17572.8286,79.3775,experimental polynomial Schur route; problem-dependent
+Y24,experimental_P10_FGMRES_POD,1,112,22.63,1187,2,18820.5235,24.04337,representative accepted-rank2 run

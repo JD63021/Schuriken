@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${WM_PROJECT_DIR:-}" ]]; then
+    echo "ERROR: OpenFOAM environment is not loaded." >&2
+    echo "Example: source /opt/openfoam12/etc/bashrc" >&2
+    exit 2
+fi
+
+if [[ "${WM_PROJECT_VERSION:-}" != "12" ]]; then
+    echo "WARNING: Schuriken is developed/tested for OpenFOAM Foundation v12." >&2
+    echo "WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unknown}" >&2
+fi
+
+cd "$(dirname "$0")/src"
+wmake libso .
+
+echo
+printf 'SCHURIKEN_BUILD=PASS\n'
+printf 'library=%s/libSchuriken.so\n' "${FOAM_USER_LIBBIN}"

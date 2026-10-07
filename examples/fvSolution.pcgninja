@@ -1,0 +1,52 @@
+// Replace an existing symmetric pressure solver block with this pattern.
+p
+{
+    solver          pcgninja;
+
+    // Stock OpenFOAM-12 GAMG preconditioner.  These controls are independent
+    // of AMGsensei and may be tuned exactly as for PCG + GAMG.
+    preconditioner
+    {
+        preconditioner  GAMG;
+        nVcycles        1;
+        smoother        symGaussSeidel;
+        tolerance       1e-12;
+        relTol          0;
+    }
+
+    tolerance       1e-5;
+    relTol          0.1;
+    maxIter         500;
+
+    AMGsensei
+    {
+        enabled             true;
+        trainSnapshots      3;
+        addRank             2;
+        maxRank             24;
+        recompressRank      16;
+        tailIter            10;
+        learnOddOnly        1;
+    }
+}
+
+pFinal
+{
+    $p;
+    relTol          0;
+}
+
+
+// Outer nonlinear convergence is ordinary OpenFOAM control; Schuriken does
+// not define a separate SIMPLE/PIMPLE tolerance. Put this in the algorithm
+// dictionary used by the case, for example:
+//
+// PIMPLE
+// {
+//     residualControl
+//     {
+//         U       1e-4;
+//         k       1e-4;
+//         omega   1e-4;
+//     }
+// }

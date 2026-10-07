@@ -1,0 +1,10 @@
+solver/PCGNinja.C
+sensei/AMGsensei.C
+sensei/AMGsenseiState.C
+sensei/AMGsenseiTrainer.C
+preconditioner/RecycledGAMG.C
+linalg/DistributedOps.C
+linalg/DenseOps.C
+linalg/PODBasis.C
+
+LIB = $(FOAM_USER_LIBBIN)/libSchuriken
