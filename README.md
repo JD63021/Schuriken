@@ -111,6 +111,49 @@ pFinal
 }
 ```
 
+### AMGsensei controls
+
+| Entry | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | `false` gives plain PCG + GAMG |
+| `trainSnapshots` | 3 | snapshots per POD batch |
+| `addRank` | 2 | modes added per batch |
+| `maxRank` | 24 | basis size limit |
+| `recompress` | `no` | at `maxRank`: `no` keeps the full basis and stops learning; `yes` recompresses to `recompressRank` and keeps learning |
+| `recompressRank` | 16 | size after a spectral recompression |
+| `tailIter` | 10 | PCG depth of the tail snapshot |
+| `learn` | (unset) | `yes`/`no` per solver dictionary; overrides `learnOddOnly` |
+| `learnOddOnly` | 1 | without `learn`: learn on odd solves of the field (1) or every solve (0) |
+| `persist` | `no` | write the basis to the time directories and read it back on restart |
+| `checkSymmetry` | `false` | test diagnostic: print the asymmetry of the recycled preconditioner |
+
+`learn` replaces the odd/even rule when the number of pressure solves per outer
+iteration is not two. OpenFOAM merges sub-dictionaries, so `pFinal` can inherit
+everything and switch learning off alone:
+
+```text
+pFinal
+{
+    $p;
+    relTol          0;
+    AMGsensei { learn no; }
+}
+```
+
+Each field keeps its own adaptive state in its mesh region, so several fields or
+regions (e.g. `foamMultiRun`) learn independently.
+
+With `persist yes` the basis of field `p` is written in binary as
+`<time>/AMGsensei_p` (per processor in parallel) at every write time. A restart
+reads it from the start time when the cell count matches; otherwise learning
+starts afresh. Set it in the first-solved dictionary (`p`; `$p` passes it on).
+
+`recompress` defaults to `no` because that is how the published results were
+obtained: before the sign fix in this version recompression never ran, so
+the basis froze at `maxRank`. On the Y24 pipe, enabling it cost about 13% more
+PCG iterations on 2 ranks. It may suit long transients, where an old basis can
+go stale.
+
 ### Tolerances
 
 Schuriken does **not** add a second tolerance system.
@@ -156,6 +199,11 @@ Each rank stores its local part of every recycled vector. Global POD inner
 products and reduced matrices are formed with batched collectives on the mesh
 communicator. The full pressure or POD vectors are never gathered to one rank.
 
+A recycled PCG iteration needs three collectives, the same as stock PCG:
+`W^T r` travels with the residual norm and `(AW)^T M t` with `r.z`. When
+OpenFOAM is built with MPI each batch is one `MPI_Allreduce` (OpenFOAM-12
+itself only all-reduces single scalars); otherwise a gather/scatter is used.
+
 
 ## Reproducible Y24 example
 
@@ -192,22 +240,28 @@ src/
 │   ├── RecycledGAMG.H
 │   └── RecycledGAMG.C
 ├── linalg/
+│   ├── AllReduce.H
+│   ├── AllReduce.C
 │   ├── DistributedOps.H
 │   ├── DistributedOps.C
 │   ├── DenseOps.H
 │   ├── DenseOps.C
 │   ├── PODBasis.H
-│   └── PODBasis.C
+│   ├── PODBasis.C
+│   ├── ReducedSpace.H
+│   └── ReducedSpace.C
 └── Make/
 ```
 
 The responsibilities are intentionally separated:
 
 - `solver/`: OpenFOAM runtime registration and the PCG iteration.
-- `sensei/`: user configuration, persistent adaptive state, snapshot training,
-  basis augmentation and spectral recompression.
+- `sensei/`: user configuration, per-field adaptive state (registry-held,
+  optionally persisted), snapshot training, basis augmentation and spectral
+  recompression.
 - `preconditioner/`: balanced recycled correction wrapped around stock GAMG.
-- `linalg/`: distributed reductions, small dense algebra, and snapshot POD.
+- `linalg/`: batched distributed reductions, cache-blocked multi-vector kernels,
+  small dense algebra, snapshot POD and the reduced space `A W`, `W^T A W`.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for details.
 
@@ -270,9 +324,8 @@ Additional development data are in `benchmarks/results.csv`.
 - symmetric LDU systems
 - PCG + stock GAMG + adaptive recycled POD
 - serial and distributed-memory MPI
-- one in-memory adaptive state for the current field
-- no persistent POD checkpoint/restart yet
-- multi-region/per-field state isolation is a future cleanup
+- one adaptive state per field and mesh region, optionally persisted for
+  restarts (same decomposition only)
 
 The experimental polynomial/matrix-free FGMRES work is intentionally not part
 of the default solver yet. The modular layout is designed so future BiCGStab or
@@ -298,7 +351,22 @@ MPI smoke:
 ./tests/smoke_cavity_mpi.sh 2
 ```
 
-Full build + smoke sequence:
+Algorithm and feature tests (cavity based, a few seconds each; `NP` runs the
+case on `NP` MPI ranks):
+
+```bash
+./tests/unit_linalg.sh             # dense/distributed algebra unit tests
+./tests/recompress_cavity.sh       # spectral recompression runs; recompress no keeps the basis
+./tests/symmetry_cavity.sh [NP]    # recycled preconditioner symmetric to round-off
+./tests/learn_cavity.sh            # explicit learn switch
+./tests/multiregion_cavity.sh      # one state per foamMultiRun region
+./tests/restart_cavity.sh [NP]     # persist: basis written and restored
+```
+
+Test cases are created under `/tmp` (override with `SCHURIKEN_TEST_CASE`); an
+existing case directory is moved aside to `<case>.oldN`, never deleted.
+
+Full build + test sequence:
 
 ```bash
 ./install_and_test.sh

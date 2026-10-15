@@ -1,5 +1,6 @@
 src/lnInclude/
 src/Make/linux*/
+tests/unit/Make/linux*/
 *.so
 log.*
 *.swp

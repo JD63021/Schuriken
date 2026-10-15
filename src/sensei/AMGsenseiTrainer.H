@@ -7,6 +7,7 @@
 
 #include "AMGsensei.H"
 #include "AMGsenseiState.H"
+#include "ReducedSpace.H"
 #include "lduMatrix.H"
 
 namespace Foam
@@ -14,6 +15,9 @@ namespace Foam
 namespace schuriken
 {
 
+// Learn from a completed solve.  space must hold A W and W^T A W for the
+// solve's matrix and current W; it is extended with W and cleared if W is
+// recompressed.
 void updateSenseiAfterSolve
 (
     AMGsenseiState& state,
@@ -29,6 +33,7 @@ void updateSenseiAfterSolve
     const FieldField<Field, scalar>& interfaceBouCoeffs,
     const lduInterfaceFieldPtrsList& interfaces,
     lduMatrix::preconditioner& gamg,
+    ReducedSpace& space,
     const direction cmpt,
     const label comm
 );

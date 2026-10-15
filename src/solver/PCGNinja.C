@@ -7,8 +7,10 @@
 #include "AMGsenseiState.H"
 #include "AMGsenseiTrainer.H"
 #include "RecycledGAMG.H"
+#include "ReducedSpace.H"
 #include "Pstream.H"
 
+#include <chrono>
 #include <vector>
 
 namespace Foam
@@ -18,6 +20,18 @@ namespace Foam
     lduMatrix::solver::
     addsymMatrixConstructorToTable<PCGNinja>
         addPCGNinjaSymMatrixConstructorToTable_;
+}
+
+namespace
+{
+    // Monotonic seconds; the wall clock may jump (e.g. under WSL)
+    double monotonicSeconds()
+    {
+        return std::chrono::duration<double>
+        (
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+    }
 }
 
 Foam::PCGNinja::PCGNinja
@@ -82,7 +96,22 @@ Foam::solverPerformance Foam::PCGNinja::solve
             << exit(FatalError);
     }
 
-    AMGsenseiState& senseiState = schuriken::state();
+    AMGsenseiState& senseiState =
+        schuriken::state(matrix().mesh(), fieldName_, sensei.persist());
+
+    if (senseiState.restoredRank >= 0 && senseiState.solveCount == 0)
+    {
+        Info
+            << "SCHURIKEN_AMGSENSEI_RESTART"
+            << " region=" << senseiState.region
+            << " field=" << fieldName_
+            << " rank=" << senseiState.restoredRank
+            << " cellsFile=" << senseiState.nCells
+            << " cellsMesh=" << nCells
+            << " status="
+            << (senseiState.nCells == nCells ? "PASS" : "REJECTED")
+            << endl;
+    }
 
     if
     (
@@ -94,6 +123,7 @@ Foam::solverPerformance Foam::PCGNinja::solve
         senseiState.reset(nCells, fieldName_);
         Info
             << "SCHURIKEN_AMGSENSEI_RESET"
+            << " region=" << senseiState.region
             << " field=" << fieldName_
             << " cells=" << nCells
             << " status=PASS" << endl;
@@ -101,25 +131,38 @@ Foam::solverPerformance Foam::PCGNinja::solve
 
     ++senseiState.solveCount;
     const label solveNo = senseiState.solveCount;
-    const bool learnThisSolve =
-        senseiEnabled && (!learnOddOnly || (solveNo % 2 == 1));
+    const bool learnThisSolve = sensei.learnThisSolve(solveNo);
 
     if (solveNo == 1)
     {
         Info
             << "SCHURIKEN_AMGSENSEI_CONFIG"
+            << " region=" << senseiState.region
+            << " field=" << fieldName_
             << " enabled=" << (senseiEnabled ? 1 : 0)
             << " trainSnapshots=" << trainSnapshots
             << " addRank=" << addRank
             << " maxRank=" << maxRank
             << " recompressRank=" << recompressRank
+            << " recompress=" << (sensei.recompress() ? "yes" : "no")
+            << " persist=" << (sensei.persist() ? "yes" : "no")
             << " tailIter=" << tailIter
             << " learnOddOnly=" << learnOddOnly
+            << " learn=" << sensei.learnMode()
             << " parallel=" << (Pstream::parRun() ? 1 : 0)
             << " nProcs=" << Pstream::nProcs()
             << " reductionPolicy=BATCHED_GLOBAL_POD"
             << " status=PASS" << endl;
     }
+
+    double tick = monotonicSeconds();
+    const auto lap = [&tick]()
+    {
+        const double now = monotonicSeconds();
+        const double dt = now - tick;
+        tick = now;
+        return dt;
+    };
 
     autoPtr<lduMatrix::preconditioner> gamgPtr =
         lduMatrix::preconditioner::New(*this, controlDict_);
@@ -130,16 +173,38 @@ Foam::solverPerformance Foam::PCGNinja::solve
     const std::vector<scalarField>& activeBasis =
         senseiEnabled ? senseiState.W : emptyBasis;
 
-    RecycledGAMG recycled
+    // A singular W^T A W must not stop the CFD run: keep the independent
+    // part of the basis, or fall back to stock PCG+GAMG with an empty one.
+    schuriken::ReducedSpace space;
+    if
     (
-        matrix_,
-        interfaceBouCoeffs_,
-        interfaces_,
-        *gamgPtr,
-        activeBasis,
-        cmpt,
-        comm
-    );
+        !activeBasis.empty()
+     && !schuriken::buildReducedSpace
+        (
+            matrix_,
+            interfaceBouCoeffs_,
+            interfaces_,
+            cmpt,
+            comm,
+            activeBasis,
+            space
+        )
+    )
+    {
+        const label rankOld = senseiState.W.size();
+        const label rankNew =
+            schuriken::repairBasis(senseiState.W, space, comm);
+
+        Info
+            << "SCHURIKEN_AMGSENSEI_REPAIR"
+            << " solve=" << solveNo
+            << " rankOld=" << rankOld
+            << " rankNew=" << rankNew
+            << " reason=G_SINGULAR"
+            << " status=PASS" << endl;
+    }
+
+    RecycledGAMG recycled(*gamgPtr, activeBasis, space, cmpt, comm);
 
     const bool usedPOD = recycled.active();
     if (usedPOD)
@@ -158,7 +223,24 @@ Foam::solverPerformance Foam::PCGNinja::solve
             << " GcondAbs=" << gcond
             << " policy=CURRENT_A"
             << " status=PASS" << endl;
+
+        if (sensei.checkSymmetry())
+        {
+            scalar relAsymP = 0;
+            scalar relAsymM = 0;
+            recycled.symmetryCheck(relAsymP, relAsymM);
+            Info
+                << "SCHURIKEN_AMGSENSEI_SYMMETRY"
+                << " solve=" << solveNo
+                << " rank=" << recycled.rank()
+                << " relAsymP=" << relAsymP
+                << " relAsymM=" << relAsymM
+                << " status=PASS" << endl;
+        }
     }
+
+    const double setupDt = lap();
+    senseiState.setupSeconds += setupDt;
 
     solverPerformance solverPerf(word("pcgninja"), fieldName_);
 
@@ -184,8 +266,11 @@ Foam::solverPerformance Foam::PCGNinja::solve
 
     const scalar normFactor = this->normFactor(psi, source, wA, pA);
 
+    // Every iteration needs three collectives, as stock PCG: W^T r travels
+    // with the residual norm and (AW)^T M t with r.z
+    std::vector<scalar> Wtr;
     solverPerf.initialResidual() =
-        gSumMag(rA, matrix().mesh().comm())/normFactor;
+        recycled.residualSumMag(rA, Wtr)/normFactor;
     solverPerf.finalResidual() = solverPerf.initialResidual();
 
     if
@@ -197,9 +282,7 @@ Foam::solverPerformance Foam::PCGNinja::solve
         do
         {
             wArAold = wArA;
-            recycled.apply(rA, wA);
-
-            wArA = gSumProd(wA, rA, matrix().mesh().comm());
+            wArA = recycled.apply(rA, Wtr, wA);
 
             if (solverPerf.nIterations() == 0)
             {
@@ -251,7 +334,7 @@ Foam::solverPerformance Foam::PCGNinja::solve
             }
 
             solverPerf.finalResidual() =
-                gSumMag(rA, matrix().mesh().comm())/normFactor;
+                recycled.residualSumMag(rA, Wtr)/normFactor;
         }
         while
         (
@@ -264,6 +347,8 @@ Foam::solverPerformance Foam::PCGNinja::solve
     }
 
     const label finalIts = solverPerf.nIterations();
+    const double iterDt = lap();
+    senseiState.iterSeconds += iterDt;
 
     if (usedPOD)
     {
@@ -278,6 +363,7 @@ Foam::solverPerformance Foam::PCGNinja::solve
 
     Info
         << "SCHURIKEN_AMGSENSEI_SOLVE"
+        << " region=" << senseiState.region
         << " solve=" << solveNo
         << " learn=" << (learnThisSolve ? 1 : 0)
         << " rank=" << senseiState.W.size()
@@ -285,6 +371,7 @@ Foam::solverPerformance Foam::PCGNinja::solve
         << " pCG=" << finalIts
         << " initialResidual=" << solverPerf.initialResidual()
         << " finalResidual=" << solverPerf.finalResidual()
+        << " seconds=" << setupDt + iterDt
         << " status=PASS" << endl;
 
     schuriken::updateSenseiAfterSolve
@@ -302,9 +389,11 @@ Foam::solverPerformance Foam::PCGNinja::solve
         interfaceBouCoeffs_,
         interfaces_,
         *gamgPtr,
+        space,
         cmpt,
         comm
     );
+    senseiState.trainSeconds += lap();
 
     schuriken::printSenseiCumulative(senseiState, sensei);
 

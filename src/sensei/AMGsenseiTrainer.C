@@ -31,6 +31,7 @@ void updateSenseiAfterSolve
     const FieldField<Field, scalar>& interfaceBouCoeffs,
     const lduInterfaceFieldPtrsList& interfaces,
     lduMatrix::preconditioner& gamg,
+    ReducedSpace& space,
     const direction cmpt,
     const label comm
 )
@@ -46,6 +47,17 @@ void updateSenseiAfterSolve
     const label maxRank = config.maxRank();
     const label recompressRank = config.recompressRank();
     const label tailIter = config.tailIter();
+
+    // Without recompression a full basis is kept as it is
+    if
+    (
+        !config.recompress()
+     && static_cast<label>(state.W.size()) >= maxRank
+    )
+    {
+        state.batch.clear();
+        return;
+    }
 
     scalarField snapshot(nCells, 0.0);
     bool haveSnapshot = false;
@@ -113,6 +125,36 @@ void updateSenseiAfterSolve
 
     state.batch.clear();
 
+    // The solve's reduced space normally describes W for this matrix; rebuild
+    // it only if it does not (e.g. learning without a recycled solve).
+    if
+    (
+        space.rank() != static_cast<label>(state.W.size())
+     && !buildReducedSpace
+        (
+            matrix,
+            interfaceBouCoeffs,
+            interfaces,
+            cmpt,
+            comm,
+            state.W,
+            space
+        )
+    )
+    {
+        const label rankOld = state.W.size();
+        repairBasis(state.W, space, comm);
+        Info
+            << "SCHURIKEN_AMGSENSEI_REPAIR"
+            << " solve=" << solveNo
+            << " rankOld=" << rankOld
+            << " rankNew=" << state.W.size()
+            << " reason=G_SINGULAR_TRAINER"
+            << " status=PASS" << endl;
+    }
+
+    // W and its reduced space grow together.  The matrix is unchanged since
+    // the solve, so only the new column needs matrix products.
     const auto appendAOrthogonal =
     [&](scalarField v) -> bool
     {
@@ -121,59 +163,21 @@ void updateSenseiAfterSolve
             return false;
         }
 
-        for (label pass=0; pass<2; ++pass)
+        scalarField Av(nCells, 0.0);
+        applyMatrix(matrix, interfaceBouCoeffs, interfaces, cmpt, v, Av);
+
+        // Two passes of A-orthogonal projection; AW updates A v alongside v
+        const label r = space.rank();
+        for (label pass=0; pass<2 && r>0; ++pass)
         {
-            if (state.W.empty())
+            std::vector<scalar> c =
+                denseMatVec(space.Ginv, dotBatchGlobal(state.W, Av, comm), r);
+            for (scalar& cj : c)
             {
-                break;
+                cj = -cj;
             }
-
-            std::vector<scalarField> curAW;
-            std::vector<scalar> curG;
-            std::vector<scalar> curGinv;
-            if
-            (
-                !buildReducedSpace
-                (
-                    matrix,
-                    interfaceBouCoeffs,
-                    interfaces,
-                    cmpt,
-                    comm,
-                    state.W,
-                    curAW,
-                    curG,
-                    curGinv
-                )
-            )
-            {
-                return false;
-            }
-
-            scalarField Av(nCells, 0.0);
-            applyMatrix
-            (
-                matrix,
-                interfaceBouCoeffs,
-                interfaces,
-                cmpt,
-                v,
-                Av
-            );
-
-            const label r = static_cast<label>(state.W.size());
-            const std::vector<scalar> h = dotBatchGlobal(state.W, Av, comm);
-            const std::vector<scalar> c = denseMatVec(curGinv, h, r);
-
-            for (label j=0; j<r; ++j)
-            {
-                const scalar cj = c[static_cast<std::size_t>(j)];
-                const scalarField& wj = state.W[static_cast<std::size_t>(j)];
-                forAll(v, cell)
-                {
-                    v[cell] -= cj*wj[cell];
-                }
-            }
+            addCombination(v, state.W, c);
+            addCombination(Av, space.AW, c);
         }
 
         const scalar projectedNorm = normGlobal(v, comm);
@@ -182,19 +186,15 @@ void updateSenseiAfterSolve
             return false;
         }
 
-        scalarField Av(nCells, 0.0);
-        applyMatrix
-        (
-            matrix,
-            interfaceBouCoeffs,
-            interfaces,
-            cmpt,
-            v,
-            Av
-        );
-        const scalar aEnergy = dotGlobal(v, Av, comm);
+        // Exact A v for the stored column
+        applyMatrix(matrix, interfaceBouCoeffs, interfaces, cmpt, v, Av);
 
-        state.W.push_back(v);
+        scalar aEnergy = 0.0;
+        if (!appendToReducedSpace(state.W, space, v, Av, aEnergy, comm))
+        {
+            return false;
+        }
+
         Info
             << "SCHURIKEN_AMGSENSEI_CANDIDATE"
             << " solve=" << solveNo
@@ -239,43 +239,59 @@ void updateSenseiAfterSolve
         return;
     }
 
-    std::vector<scalarField> fullAW;
-    std::vector<scalar> fullG;
-    std::vector<scalar> fullGinv;
-    const label oldR = static_cast<label>(state.W.size());
-
-    if
-    (
-        !buildReducedSpace
-        (
-            matrix,
-            interfaceBouCoeffs,
-            interfaces,
-            cmpt,
-            comm,
-            state.W,
-            fullAW,
-            fullG,
-            fullGinv
-        )
-    )
+    if (!config.recompress())
     {
+        Info
+            << "SCHURIKEN_AMGSENSEI_BASIS_FULL"
+            << " solve=" << solveNo
+            << " rank=" << state.W.size()
+            << " recompress=no learning=stopped"
+            << " status=PASS" << endl;
+        return;
+    }
+
+    const label oldR = static_cast<label>(state.W.size());
+    const label keep = min(recompressRank, oldR);
+
+    // If the spectral selection is impossible, keep the newest vectors so
+    // the basis can still adapt instead of freezing at maxRank.
+    const auto keepNewest = [&](const char* reason)
+    {
+        std::vector<scalarField> Wnew
+        (
+            state.W.end() - keep,
+            state.W.end()
+        );
+        state.W.swap(Wnew);
+        space.clear();
+        ++state.recompressCount;
+
+        Info
+            << "SCHURIKEN_AMGSENSEI_RECOMPRESS"
+            << " solve=" << solveNo
+            << " cycle=" << state.recompressCount
+            << " rankOld=" << oldR
+            << " rankNew=" << state.W.size()
+            << " method=keep_newest"
+            << " reason=" << reason
+            << " status=PASS" << endl;
+    };
+
+    if (space.rank() != oldR)
+    {
+        keepNewest("SPACE_MISMATCH");
         return;
     }
 
     std::vector<scalar> Gmhalf;
+    scalar gSign = 1.0;
     scalar gmin = 0.0;
     scalar gmax = 0.0;
     scalar gcond = 0.0;
 
-    if (!spdInvSqrt(fullG, oldR, Gmhalf, gmin, gmax, gcond))
+    if (!definiteInvSqrt(space.G, oldR, Gmhalf, gSign, gmin, gmax, gcond))
     {
-        Info
-            << "SCHURIKEN_AMGSENSEI_RECOMPRESS_SKIP"
-            << " solve=" << solveNo
-            << " rank=" << oldR
-            << " reason=G_NOT_SPD"
-            << " status=PASS" << endl;
+        keepNewest("G_NOT_DEFINITE");
         return;
     }
 
@@ -284,12 +300,18 @@ void updateSenseiAfterSolve
     for (label j=0; j<oldR; ++j)
     {
         scalarField baw(nCells, 0.0);
-        gamg.precondition(baw, fullAW[static_cast<std::size_t>(j)], cmpt);
+        gamg.precondition(baw, space.AW[static_cast<std::size_t>(j)], cmpt);
         BAW.push_back(baw);
     }
 
-    std::vector<scalar> K = crossGramGlobal(fullAW, BAW, comm);
+    // K = (AW)^T M (AW) has the same sign as G for a definite A and M, so
+    // scaling both by gSign keeps the generalized Ritz values mu positive.
+    std::vector<scalar> K = crossGramGlobal(space.AW, BAW, comm);
     symmetrize(K, oldR);
+    for (scalar& k : K)
+    {
+        k *= gSign;
+    }
 
     std::vector<scalar> R = denseMul(denseMul(Gmhalf, K, oldR), Gmhalf, oldR);
     symmetrize(R, oldR);
@@ -298,6 +320,7 @@ void updateSenseiAfterSolve
     std::vector<scalar> Y;
     if (!jacobiEigenSymmetric(R, oldR, mu, Y))
     {
+        keepNewest("RITZ_EIGEN_FAILED");
         return;
     }
 
@@ -317,7 +340,6 @@ void updateSenseiAfterSolve
         }
     );
 
-    const label keep = min(recompressRank, oldR);
     const scalar muMin = mu[static_cast<std::size_t>(order.front())];
     const scalar muMax = mu[static_cast<std::size_t>(order.back())];
     const scalar muSelMax =
@@ -348,26 +370,19 @@ void updateSenseiAfterSolve
         }
 
         scalarField wnew(nCells, 0.0);
-        for (label j=0; j<oldR; ++j)
-        {
-            const scalar cj = coeff[static_cast<std::size_t>(j)];
-            const scalarField& wj = state.W[static_cast<std::size_t>(j)];
-            forAll(wnew, cell)
-            {
-                wnew[cell] += cj*wj[cell];
-            }
-        }
+        addCombination(wnew, state.W, coeff);
 
         if (!normalizeEuclid(wnew, comm))
         {
-            FatalErrorInFunction
-                << "Spectral recompression produced zero/nonfinite mode"
-                << exit(FatalError);
+            keepNewest("ZERO_OR_NONFINITE_MODE");
+            return;
         }
         Wnew.push_back(wnew);
     }
 
+    // space no longer describes W; the next solve rebuilds it for its matrix
     state.W.swap(Wnew);
+    space.clear();
     ++state.recompressCount;
 
     Info
@@ -382,6 +397,7 @@ void updateSenseiAfterSolve
         << " spectralCondition="
         << (mag(muMin) > VSMALL ? muMax/mag(muMin) : GREAT)
         << " Gcond=" << gcond
+        << " Gsign=" << gSign
         << " metric=GENERALIZED_RITZ_AWB0AW_OVER_WAW"
         << " status=PASS" << endl;
 
@@ -404,6 +420,8 @@ void printSenseiCumulative
 {
     Info
         << "SCHURIKEN_AMGSENSEI_CUMULATIVE"
+        << " region=" << state.region
+        << " field=" << state.fieldName
         << " solves=" << state.solveCount
         << " rank=" << state.W.size()
         << " stockSolves=" << state.stockSolves
@@ -413,6 +431,9 @@ void printSenseiCumulative
         << " totalPCGIts=" << (state.stockPCGIts + state.podPCGIts)
         << " acceptedUpdates=" << state.acceptedUpdates
         << " recompressCount=" << state.recompressCount
+        << " setupSeconds=" << state.setupSeconds
+        << " iterSeconds=" << state.iterSeconds
+        << " trainSeconds=" << state.trainSeconds
         << " learnOddOnly=" << config.learnOddOnly()
         << " enabled=" << (config.enabled() ? 1 : 0)
         << " status=PASS" << endl;

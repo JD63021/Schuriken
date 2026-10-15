@@ -3,8 +3,12 @@
  */
 
 #include "RecycledGAMG.H"
+#include "AllReduce.H"
 #include "DenseOps.H"
 #include "DistributedOps.H"
+#include "Pstream.H"
+
+#include <cmath>
 
 namespace Foam
 {
@@ -32,16 +36,14 @@ bool buildReducedSpace
     const direction cmpt,
     const label comm,
     const std::vector<scalarField>& W,
-    std::vector<scalarField>& AW,
-    std::vector<scalar>& G,
-    std::vector<scalar>& Ginv
+    ReducedSpace& space
 )
 {
     const label r = static_cast<label>(W.size());
     const label nCells = matrix.diag().size();
 
-    AW.clear();
-    AW.reserve(static_cast<std::size_t>(r));
+    space.clear();
+    space.AW.reserve(static_cast<std::size_t>(r));
     for (label j=0; j<r; ++j)
     {
         scalarField aw(nCells, 0.0);
@@ -54,110 +56,116 @@ bool buildReducedSpace
             W[static_cast<std::size_t>(j)],
             aw
         );
-        AW.push_back(aw);
+        space.AW.push_back(aw);
     }
 
-    G = crossGramGlobal(W, AW, comm);
-    symmetrize(G, r);
-    return invertDense(G, r, Ginv);
+    return factorReducedSpace(W, space, comm);
 }
 
 RecycledGAMG::RecycledGAMG
 (
-    const lduMatrix& matrix,
-    const FieldField<Field, scalar>& interfaceBouCoeffs,
-    const lduInterfaceFieldPtrsList& interfaces,
     lduMatrix::preconditioner& gamg,
     const std::vector<scalarField>& W,
+    const ReducedSpace& space,
     const direction cmpt,
     const label comm
 )
 :
-    matrix_(matrix),
-    interfaceBouCoeffs_(interfaceBouCoeffs),
-    interfaces_(interfaces),
     gamg_(gamg),
     W_(W),
+    space_(space),
     cmpt_(cmpt),
     comm_(comm),
-    AW_(),
-    G_(),
-    Ginv_(),
-    active_(!W.empty())
+    active_(!W.empty() && space.rank() == static_cast<label>(W.size())),
+    t_(W.empty() ? 0 : W[0].size())
+{}
+
+scalar RecycledGAMG::residualSumMag
+(
+    const scalarField& r,
+    std::vector<scalar>& Wtr
+) const
 {
-    if
-    (
-        active_
-     && !buildReducedSpace
-        (
-            matrix_,
-            interfaceBouCoeffs_,
-            interfaces_,
-            cmpt_,
-            comm_,
-            W_,
-            AW_,
-            G_,
-            Ginv_
-        )
-    )
+    const label rnk = active_ ? rank() : 0;
+
+    // [sum|r|, W^T r] in one collective
+    std::vector<scalar> values(1, 0.0);
+    forAll(r, cell)
     {
-        FatalErrorInFunction
-            << "Current reduced matrix W^T A W is singular. rank="
-            << W_.size()
-            << exit(FatalError);
+        values[0] += mag(r[cell]);
     }
+    if (rnk)
+    {
+        const std::vector<scalar> local = dotBatchLocal(W_, r);
+        values.insert(values.end(), local.begin(), local.end());
+    }
+    sumAllReduce(values.data(), rnk + 1, comm_);
+
+    Wtr.assign(values.begin() + 1, values.end());
+    return values[0];
 }
 
-void RecycledGAMG::apply(const scalarField& r, scalarField& z) const
+scalar RecycledGAMG::apply
+(
+    const scalarField& r,
+    const std::vector<scalar>& Wtr,
+    scalarField& z
+) const
 {
     if (!active_)
     {
         gamg_.precondition(z, r, cmpt_);
-        return;
+        return gSumProd(z, r, comm_);
     }
 
     const label rnk = rank();
-    const label nCells = r.size();
 
-    const std::vector<scalar> rhs = dotBatchGlobal(W_, r, comm_);
-    const std::vector<scalar> a = denseMatVec(Ginv_, rhs, rnk);
+    // Coarse coefficients a = G^-1 W^T r and the residual they leave,
+    // t = (I - A Q) r = r - AW a
+    const std::vector<scalar> a = denseMatVec(space_.Ginv, Wtr, rnk);
 
-    scalarField q(nCells, 0.0);
-    scalarField t(r);
+    std::vector<scalar> c(a);
+    for (scalar& ck : c)
+    {
+        ck = -ck;
+    }
+    t_ = r;
+    addCombination(t_, space_.AW, c);
+
+    // g = M t, written straight into z
+    z = 0.0;
+    gamg_.precondition(z, t_, cmpt_);
+
+    // [(AW)^T g, r.g] in one collective
+    std::vector<scalar> values = dotBatchLocal(space_.AW, z);
+    values.push_back(dotLocal(r, z));
+    sumAllReduce(values.data(), rnk + 1, comm_);
+    const scalar rg = values.back();
+    values.pop_back();
+
+    // b = G^-1 (AW)^T g;  z = Q r + (I - Q A) g = g + W (a - b)
+    // and r.z = r.g + (W^T r).(a - b) without another reduction
+    const std::vector<scalar> b = denseMatVec(space_.Ginv, values, rnk);
+    scalar rz = rg;
     for (label k=0; k<rnk; ++k)
     {
-        const scalar ak = a[static_cast<std::size_t>(k)];
-        const scalarField& wk = W_[static_cast<std::size_t>(k)];
-        const scalarField& awk = AW_[static_cast<std::size_t>(k)];
-        forAll(q, cell)
-        {
-            q[cell] += ak*wk[cell];
-            t[cell] -= ak*awk[cell];
-        }
+        const std::size_t kk = static_cast<std::size_t>(k);
+        c[kk] = a[kk] - b[kk];
+        rz += Wtr[kk]*c[kk];
     }
+    addCombination(z, W_, c);
 
-    scalarField g(nCells, 0.0);
-    gamg_.precondition(g, t, cmpt_);
+    return rz;
+}
 
-    const std::vector<scalar> rhs2 = dotBatchGlobal(AW_, g, comm_);
-    const std::vector<scalar> b = denseMatVec(Ginv_, rhs2, rnk);
-
-    z = q;
-    forAll(z, cell)
+void RecycledGAMG::apply(const scalarField& r, scalarField& z) const
+{
+    std::vector<scalar> Wtr;
+    if (active_)
     {
-        z[cell] += g[cell];
+        Wtr = dotBatchGlobal(W_, r, comm_);
     }
-
-    for (label k=0; k<rnk; ++k)
-    {
-        const scalar bk = b[static_cast<std::size_t>(k)];
-        const scalarField& wk = W_[static_cast<std::size_t>(k)];
-        forAll(z, cell)
-        {
-            z[cell] -= bk*wk[cell];
-        }
-    }
+    apply(r, Wtr, z);
 }
 
 void RecycledGAMG::gramSpectrumAbs
@@ -178,7 +186,7 @@ void RecycledGAMG::gramSpectrumAbs
 
     std::vector<scalar> eval;
     std::vector<scalar> V;
-    if (jacobiEigenSymmetric(G_, rank(), eval, V))
+    if (jacobiEigenSymmetric(space_.G, rank(), eval, V))
     {
         for (std::size_t i=0; i<eval.size(); ++i)
         {
@@ -187,6 +195,51 @@ void RecycledGAMG::gramSpectrumAbs
         }
         gcond = gmin > VSMALL ? gmax/gmin : GREAT;
     }
+}
+
+void RecycledGAMG::symmetryCheck
+(
+    scalar& relAsymP,
+    scalar& relAsymM
+) const
+{
+    const label nCells = W_.empty() ? 0 : W_[0].size();
+    const label seed = Pstream::myProcNo(comm_);
+
+    scalarField x(nCells);
+    scalarField y(nCells);
+    forAll(x, cell)
+    {
+        const scalar sx =
+            std::sin(12.9898*(cell + 1) + 78.233*seed)*43758.5453;
+        const scalar sy =
+            std::sin(39.3468*(cell + 1) + 11.135*seed)*24634.6345;
+        x[cell] = sx - std::floor(sx) - 0.5;
+        y[cell] = sy - std::floor(sy) - 0.5;
+    }
+
+    const auto relAsym = [this]
+    (
+        const scalarField& Px,
+        const scalarField& Py,
+        const scalarField& x,
+        const scalarField& y
+    )
+    {
+        const scalar yPx = dotGlobal(y, Px, comm_);
+        const scalar xPy = dotGlobal(x, Py, comm_);
+        return mag(yPx - xPy)/max(max(mag(yPx), mag(xPy)), VSMALL);
+    };
+
+    scalarField Px(nCells, 0.0);
+    scalarField Py(nCells, 0.0);
+    apply(x, Px);
+    apply(y, Py);
+    relAsymP = relAsym(Px, Py, x, y);
+
+    gamg_.precondition(Px, x, cmpt_);
+    gamg_.precondition(Py, y, cmpt_);
+    relAsymM = relAsym(Px, Py, x, y);
 }
 
 }

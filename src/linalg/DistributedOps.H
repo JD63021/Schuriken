@@ -19,6 +19,13 @@ scalar dotLocal(const scalarField& a, const scalarField& b);
 scalar dotGlobal(const scalarField& a, const scalarField& b, const label comm);
 scalar normGlobal(const scalarField& a, const label comm);
 
+// Local V_k . x for every k in one cache-blocked pass over x
+std::vector<scalar> dotBatchLocal
+(
+    const std::vector<scalarField>& V,
+    const scalarField& x
+);
+
 std::vector<scalar> dotBatchGlobal
 (
     const std::vector<scalarField>& left,
@@ -31,6 +38,14 @@ std::vector<scalar> crossGramGlobal
     const std::vector<scalarField>& left,
     const std::vector<scalarField>& right,
     const label comm
+);
+
+// y += sum_k c_k V_k in one cache-blocked pass over y
+void addCombination
+(
+    scalarField& y,
+    const std::vector<scalarField>& V,
+    const std::vector<scalar>& c
 );
 
 bool normalizeEuclid

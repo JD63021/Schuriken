@@ -1,4 +1,14 @@
+-include $(GENERAL_RULES)/mplibType
+
+# One MPI_Allreduce per batch of reduced values when MPI is configured
+ifneq ($(strip $(PINC)),)
+    SCHURIKEN_MPI = \
+        -DSCHURIKEN_HAVE_MPI $(PFLAGS) $(PINC) \
+        -I$(LIB_SRC)/Pstream/mpi/lnInclude
+endif
+
 EXE_INC = \
+    $(SCHURIKEN_MPI) \
     -I$(LIB_SRC)/OpenFOAM/lnInclude \
     -Isolver \
     -Isensei \
@@ -6,4 +16,5 @@ EXE_INC = \
     -Ilinalg
 
 LIB_LIBS = \
-    -lOpenFOAM
+    -lOpenFOAM \
+    $(PLIBS)

@@ -12,7 +12,11 @@ Foam::AMGsensei::AMGsensei(const dictionary& solverControls)
     maxRank_(24),
     recompressRank_(16),
     tailIter_(10),
-    learnOddOnly_(1)
+    learnOddOnly_(1),
+    learn_(-1),
+    recompress_(false),
+    persist_(false),
+    checkSymmetry_(false)
 {
     // Preferred Schuriken API.
     if (solverControls.found("AMGsensei"))
@@ -29,6 +33,14 @@ Foam::AMGsensei::AMGsensei(const dictionary& solverControls)
         tailIter_ = d.lookupOrDefault<label>("tailIter", tailIter_);
         learnOddOnly_ =
             d.lookupOrDefault<label>("learnOddOnly", learnOddOnly_);
+        if (d.found("learn"))
+        {
+            learn_ = d.lookup<bool>("learn") ? 1 : 0;
+        }
+        recompress_ = d.lookupOrDefault<bool>("recompress", recompress_);
+        persist_ = d.lookupOrDefault<bool>("persist", persist_);
+        checkSymmetry_ =
+            d.lookupOrDefault<bool>("checkSymmetry", checkSymmetry_);
     }
     else
     {

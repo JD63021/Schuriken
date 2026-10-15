@@ -24,9 +24,11 @@ p
         trainSnapshots      3;
         addRank             2;
         maxRank             24;
+        recompress          no;     // yes: recompress to recompressRank
         recompressRank      16;
         tailIter            10;
-        learnOddOnly        1;
+        learnOddOnly        1;      // or "learn yes|no;" per dictionary
+        persist             no;     // yes: keep the basis across restarts
     }
 }
 

@@ -3,12 +3,52 @@
  */
 
 #include "DistributedOps.H"
-#include "List.H"
+#include "AllReduce.H"
 #include "Pstream.H"
 #include "PstreamReduceOps.H"
-#include "ops.H"
 
 #include <cmath>
+
+namespace
+{
+
+using Foam::label;
+using Foam::scalar;
+
+// Cells per block in the fused multi-vector loops: one block of the shared
+// vector stays in L1 while every basis vector streams past it once.
+const label blockSize = 512;
+
+// Four partial sums break the floating-point add dependency chain
+inline scalar dotRange
+(
+    const scalar* __restrict__ a,
+    const scalar* __restrict__ b,
+    const label start,
+    const label end
+)
+{
+    scalar s0 = 0.0;
+    scalar s1 = 0.0;
+    scalar s2 = 0.0;
+    scalar s3 = 0.0;
+    label i = start;
+    for (; i + 3 < end; i += 4)
+    {
+        s0 += a[i]*b[i];
+        s1 += a[i+1]*b[i+1];
+        s2 += a[i+2]*b[i+2];
+        s3 += a[i+3]*b[i+3];
+    }
+    for (; i < end; ++i)
+    {
+        s0 += a[i]*b[i];
+    }
+    return (s0 + s1) + (s2 + s3);
+}
+
+}
+
 
 Foam::scalar Foam::schuriken::dotLocal
 (
@@ -16,12 +56,7 @@ Foam::scalar Foam::schuriken::dotLocal
     const scalarField& b
 )
 {
-    scalar s = 0.0;
-    forAll(a, i)
-    {
-        s += a[i]*b[i];
-    }
-    return s;
+    return dotRange(a.cdata(), b.cdata(), 0, a.size());
 }
 
 Foam::scalar Foam::schuriken::dotGlobal
@@ -46,6 +81,26 @@ Foam::scalar Foam::schuriken::normGlobal
     return std::sqrt(max(s, scalar(0)));
 }
 
+std::vector<Foam::scalar> Foam::schuriken::dotBatchLocal
+(
+    const std::vector<scalarField>& V,
+    const scalarField& x
+)
+{
+    const label n = x.size();
+    std::vector<scalar> values(V.size(), 0.0);
+
+    for (label start=0; start<n; start+=blockSize)
+    {
+        const label end = min(start + blockSize, n);
+        for (std::size_t k=0; k<V.size(); ++k)
+        {
+            values[k] += dotRange(V[k].cdata(), x.cdata(), start, end);
+        }
+    }
+    return values;
+}
+
 std::vector<Foam::scalar> Foam::schuriken::dotBatchGlobal
 (
     const std::vector<scalarField>& left,
@@ -53,30 +108,9 @@ std::vector<Foam::scalar> Foam::schuriken::dotBatchGlobal
     const label comm
 )
 {
-    List<scalar> values(static_cast<label>(left.size()), scalar(0));
-    for (label i=0; i<values.size(); ++i)
-    {
-        values[i] = dotLocal(left[static_cast<std::size_t>(i)], right);
-    }
-
-    if (Pstream::parRun())
-    {
-        Pstream::listCombineGather
-        (
-            values,
-            plusEqOp<scalar>(),
-            UPstream::msgType(),
-            comm
-        );
-        Pstream::listCombineScatter(values, UPstream::msgType(), comm);
-    }
-
-    std::vector<scalar> result(static_cast<std::size_t>(values.size()), 0.0);
-    forAll(values, i)
-    {
-        result[static_cast<std::size_t>(i)] = values[i];
-    }
-    return result;
+    std::vector<scalar> values = dotBatchLocal(left, right);
+    sumAllReduce(values.data(), static_cast<label>(values.size()), comm);
+    return values;
 }
 
 std::vector<Foam::scalar> Foam::schuriken::crossGramGlobal
@@ -88,38 +122,55 @@ std::vector<Foam::scalar> Foam::schuriken::crossGramGlobal
 {
     const label nr = static_cast<label>(left.size());
     const label nc = static_cast<label>(right.size());
-    List<scalar> values(nr*nc, scalar(0));
+    const label n = nr ? left[0].size() : 0;
+    std::vector<scalar> values(static_cast<std::size_t>(nr*nc), 0.0);
 
-    for (label i=0; i<nr; ++i)
+    for (label start=0; start<n; start+=blockSize)
     {
-        for (label j=0; j<nc; ++j)
+        const label end = min(start + blockSize, n);
+        for (label i=0; i<nr; ++i)
         {
-            values[i*nc+j] = dotLocal
-            (
-                left[static_cast<std::size_t>(i)],
-                right[static_cast<std::size_t>(j)]
-            );
+            const scalar* li = left[static_cast<std::size_t>(i)].cdata();
+            for (label j=0; j<nc; ++j)
+            {
+                values[static_cast<std::size_t>(i*nc+j)] += dotRange
+                (
+                    li,
+                    right[static_cast<std::size_t>(j)].cdata(),
+                    start,
+                    end
+                );
+            }
         }
     }
 
-    if (Pstream::parRun())
-    {
-        Pstream::listCombineGather
-        (
-            values,
-            plusEqOp<scalar>(),
-            UPstream::msgType(),
-            comm
-        );
-        Pstream::listCombineScatter(values, UPstream::msgType(), comm);
-    }
+    sumAllReduce(values.data(), nr*nc, comm);
+    return values;
+}
 
-    std::vector<scalar> result(static_cast<std::size_t>(nr*nc), 0.0);
-    forAll(values, i)
+void Foam::schuriken::addCombination
+(
+    scalarField& y,
+    const std::vector<scalarField>& V,
+    const std::vector<scalar>& c
+)
+{
+    const label n = y.size();
+    scalar* __restrict__ yp = y.data();
+
+    for (label start=0; start<n; start+=blockSize)
     {
-        result[static_cast<std::size_t>(i)] = values[i];
+        const label end = min(start + blockSize, n);
+        for (std::size_t k=0; k<V.size(); ++k)
+        {
+            const scalar ck = c[k];
+            const scalar* __restrict__ vk = V[k].cdata();
+            for (label i=start; i<end; ++i)
+            {
+                yp[i] += ck*vk[i];
+            }
+        }
     }
-    return result;
 }
 
 bool Foam::schuriken::normalizeEuclid

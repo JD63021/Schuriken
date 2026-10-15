@@ -62,33 +62,9 @@ bool jacobiEigenSymmetric
     }
     scale = Foam::max(scale, scalar(1e-300));
 
-    const label maxSweeps = std::max<label>(50, 20*n*n);
-
-    for (label sweep=0; sweep<maxSweeps; ++sweep)
+    // Zero A(p,q) by a plane rotation and accumulate it into V
+    const auto rotate = [&](const label p, const label q)
     {
-        label p = 0;
-        label q = 0;
-        scalar mx = 0.0;
-
-        for (label i=0; i<n; ++i)
-        {
-            for (label j=i+1; j<n; ++j)
-            {
-                const scalar v = Foam::mag(A[static_cast<std::size_t>(i*n+j)]);
-                if (v > mx)
-                {
-                    mx = v;
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-
-        if (mx <= 1e-13*scale)
-        {
-            break;
-        }
-
         const scalar app = A[static_cast<std::size_t>(p*n+p)];
         const scalar aqq = A[static_cast<std::size_t>(q*n+q)];
         const scalar apq = A[static_cast<std::size_t>(p*n+q)];
@@ -126,6 +102,38 @@ bool jacobiEigenSymmetric
             const scalar vkq = V[static_cast<std::size_t>(k*n+q)];
             V[static_cast<std::size_t>(k*n+p)] = c*vkp - s*vkq;
             V[static_cast<std::size_t>(k*n+q)] = s*vkp + c*vkq;
+        }
+    };
+
+    // Cyclic Jacobi: rotate every off-diagonal pair once per sweep instead of
+    // searching the whole matrix for the largest element before each rotation
+    const label maxSweeps = 100;
+
+    for (label sweep=0; sweep<maxSweeps; ++sweep)
+    {
+        scalar mx = 0.0;
+        for (label i=0; i<n; ++i)
+        {
+            for (label j=i+1; j<n; ++j)
+            {
+                mx = Foam::max(mx, Foam::mag(A[static_cast<std::size_t>(i*n+j)]));
+            }
+        }
+
+        if (!(mx > 1e-13*scale))
+        {
+            break;
+        }
+
+        for (label p=0; p<n-1; ++p)
+        {
+            for (label q=p+1; q<n; ++q)
+            {
+                if (Foam::mag(A[static_cast<std::size_t>(p*n+q)]) > 1e-15*scale)
+                {
+                    rotate(p, q);
+                }
+            }
         }
     }
 
@@ -262,11 +270,12 @@ std::vector<scalar> denseMul
     return C;
 }
 
-bool spdInvSqrt
+bool definiteInvSqrt
 (
     const std::vector<scalar>& G,
     const label n,
     std::vector<scalar>& Gmhalf,
+    scalar& sign,
     scalar& gmin,
     scalar& gmax,
     scalar& gcond
@@ -279,13 +288,18 @@ bool spdInvSqrt
         return false;
     }
 
-    gmin = std::numeric_limits<scalar>::max();
-    gmax = 0.0;
+    scalar emin = std::numeric_limits<scalar>::max();
+    scalar emax = -std::numeric_limits<scalar>::max();
     for (label i=0; i<n; ++i)
     {
-        gmin = Foam::min(gmin, eval[static_cast<std::size_t>(i)]);
-        gmax = Foam::max(gmax, eval[static_cast<std::size_t>(i)]);
+        emin = Foam::min(emin, eval[static_cast<std::size_t>(i)]);
+        emax = Foam::max(emax, eval[static_cast<std::size_t>(i)]);
     }
+
+    // Both extremes must share one sign; flip a negative definite G
+    sign = emax > 0.0 ? 1.0 : -1.0;
+    gmin = Foam::min(sign*emin, sign*emax);
+    gmax = Foam::max(sign*emin, sign*emax);
 
     if (!(gmax > 0.0) || !(gmin > 1e-13*gmax))
     {
@@ -297,7 +311,8 @@ bool spdInvSqrt
 
     for (label k=0; k<n; ++k)
     {
-        const scalar d = 1.0/std::sqrt(eval[static_cast<std::size_t>(k)]);
+        const scalar d =
+            1.0/std::sqrt(sign*eval[static_cast<std::size_t>(k)]);
         for (label i=0; i<n; ++i)
         {
             const scalar vik = V[static_cast<std::size_t>(i*n+k)];

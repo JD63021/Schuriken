@@ -4,13 +4,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-bash -n Allwmake Allclean install_and_test.sh tests/smoke_cavity.sh tests/smoke_cavity_mpi.sh
+bash -n Allwmake Allclean install_and_test.sh tests/lib/common.sh tests/*.sh
+python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' tests/lib/setup_cavity.py
 
 grep -q 'TypeName("pcgninja")' src/solver/PCGNinja.H
 grep -q 'addsymMatrixConstructorToTable<PCGNinja>' src/solver/PCGNinja.C
 grep -q 'updateSenseiAfterSolve' src/sensei/AMGsenseiTrainer.C
 grep -q 'BATCHED_GLOBAL_POD' src/solver/PCGNinja.C
-grep -q 'listCombineGather' src/linalg/DistributedOps.C
+grep -q 'MPI_Allreduce' src/linalg/AllReduce.C
+grep -q 'listCombineGather' src/linalg/AllReduce.C
 grep -q 'class RecycledGAMG' src/preconditioner/RecycledGAMG.H
 grep -q 'solver[[:space:]]*pcgninja' examples/fvSolution.pcgninja
 grep -q 'libSchuriken.so' examples/controlDict.libs
@@ -28,9 +30,11 @@ for f in \
   src/sensei/AMGsenseiState.C \
   src/sensei/AMGsenseiTrainer.C \
   src/preconditioner/RecycledGAMG.C \
+  src/linalg/AllReduce.C \
   src/linalg/DistributedOps.C \
   src/linalg/DenseOps.C \
-  src/linalg/PODBasis.C; do
+  src/linalg/PODBasis.C \
+  src/linalg/ReducedSpace.C; do
     grep -q "${f#src/}" src/Make/files
   done
 

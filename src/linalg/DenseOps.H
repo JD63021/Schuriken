@@ -47,11 +47,17 @@ std::vector<scalar> denseMul
     const label n
 );
 
-bool spdInvSqrt
+//- For a definite symmetric G return sign = +1 (positive definite) or -1
+//  (negative definite) and Gmhalf = (sign*G)^(-1/2).  gmin/gmax are the
+//  extreme eigenvalue magnitudes.  Returns false if G is indefinite or
+//  numerically singular.  OpenFOAM pressure matrices are negative definite,
+//  so W^T A W normally has sign = -1.
+bool definiteInvSqrt
 (
     const std::vector<scalar>& G,
     const label n,
     std::vector<scalar>& Gmhalf,
+    scalar& sign,
     scalar& gmin,
     scalar& gmax,
     scalar& gcond
